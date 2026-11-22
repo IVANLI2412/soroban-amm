@@ -332,22 +332,25 @@ export class WebhookDispatcher {
     }
 
     const body = JSON.stringify(event);
-    const headers: Record<string, string> = {
+    // Base headers without signature - signature is added per-attempt with fresh timestamp.
+    const baseHeaders: Record<string, string> = {
       "Content-Type": "application/json",
       [EVENT_ID_HEADER]: event.id,
     };
-    if (sub.secret) {
-      // Signed once per delivery, so a dead-letter replay gets a fresh timestamp.
-      headers[SIGNATURE_HEADER] = signPayload(sub.secret, body);
-      if (this.legacySecretHeader) {
-        headers["X-Webhook-Secret"] = sub.secret;
-      }
+    // Legacy secret header is not per-attempt; include it once if enabled.
+    if (sub.secret && this.legacySecretHeader) {
+      baseHeaders["X-Webhook-Secret"] = sub.secret;
     }
 
     const attempts: AttemptOutcome[] = [];
     let delayMs = 0;
 
     for (let attempt = 0; ; attempt++) {
+      // Build per-attempt headers: base + fresh signature if secret is configured.
+      const headers: Record<string, string> = { ...baseHeaders };
+      if (sub.secret) {
+        headers[SIGNATURE_HEADER] = signPayload(sub.secret, body);
+      }
       if (delayMs > 0) {
         await this.sleep(delayMs);
       }

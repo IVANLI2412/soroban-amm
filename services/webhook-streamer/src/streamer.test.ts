@@ -14,6 +14,7 @@ import {
     isRetryableStatus,
     parseRetryAfter,
 } from "./dispatcher.js";
+import { signPayload, verifySignature } from "./signing.js";
 import { DeadLetterQueue } from "./dead-letter.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
 import {
@@ -532,6 +533,40 @@ describe("local webhook delivery integration", () => {
                 const d = makeDispatcher(reg, { maxRetries: 2 });
                 await d.dispatch(EVENT);
                 assert.equal(d.metrics().retries, 2);
+            } finally {
+                await srv.close();
+            }
+        });
+
+        it("generates a fresh signature per retry attempt (each verifies independently)", async () => {
+            const srv = await startServer((hit) => ({
+                status: hit <= 2 ? 503 : 200,
+            }));
+            try {
+                const secret = "test-secret-12345678901234567890123456789012";
+                const reg = new WebhookRegistry();
+                reg.register(srv.url, { secret });
+                const d = makeDispatcher(reg, { maxRetries: 3 });
+                const [r] = await d.dispatch(EVENT);
+                assert.equal(r.success, true);
+                assert.equal(srv.hits(), 3); // initial + 2 retries
+
+                const capturedHeaders = srv.headers();
+                assert.equal(capturedHeaders.length, 3);
+
+                // Verify each attempt has a signature header and all signatures verify.
+                const body = JSON.stringify(EVENT);
+                for (const h of capturedHeaders) {
+                    const sig = h["x-webhook-signature"] as string;
+                    assert.ok(sig, "signature header present on each attempt");
+                    const vr = verifySignature({ secret, body, header: sig, toleranceSeconds: 300 });
+                    assert.equal(vr.valid, true, "signature verifies with per-attempt timestamp");
+                }
+                // X-Webhook-Id must be stable across retries for deduplication.
+                const ids = capturedHeaders.map((h) => h["x-webhook-id"] as string);
+                assert.equal(ids.length, 3);
+                assert.equal(ids[0], ids[1]);
+                assert.equal(ids[1], ids[2]);
             } finally {
                 await srv.close();
             }
