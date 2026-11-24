@@ -14,7 +14,7 @@ import {
     isRetryableStatus,
     parseRetryAfter,
 } from "./dispatcher.js";
-import { signPayload, verifySignature } from "./signing.js";
+import { verifySignature } from "./signing.js";
 import { DeadLetterQueue } from "./dead-letter.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
 import {
@@ -538,36 +538,66 @@ describe("local webhook delivery integration", () => {
             }
         });
 
-        it("generates a fresh signature per retry attempt (each verifies independently)", async () => {
+        it("re-signs each retry attempt with a fresh timestamp while keeping X-Webhook-Id stable", async () => {
             const srv = await startServer((hit) => ({
-                status: hit <= 2 ? 503 : 200,
+                status: hit < 3 ? 500 : 200,
             }));
+            const secret = "test-retry-secret";
+            const realDateNow = Date.now;
+            const baseSec = 1_700_000_000;
+            let nowMs = baseSec * 1_000;
+            Date.now = () => nowMs;
             try {
-                const secret = "test-secret-12345678901234567890123456789012";
                 const reg = new WebhookRegistry();
                 reg.register(srv.url, { secret });
-                const d = makeDispatcher(reg, { maxRetries: 3 });
+                const d = new WebhookDispatcher(reg, {
+                    timeoutMs: 200,
+                    maxRetries: 2,
+                    baseDelayMs: 10,
+                    maxDelayMs: 20,
+                    random: () => 0.5,
+                    deadLetterQueue: new DeadLetterQueue(100),
+                    circuitBreaker: new CircuitBreaker({
+                        failureThreshold: 100,
+                    }),
+                    sleep: async () => {
+                        nowMs += 200_000;
+                    },
+                });
                 const [r] = await d.dispatch(EVENT);
                 assert.equal(r.success, true);
-                assert.equal(srv.hits(), 3); // initial + 2 retries
+                assert.equal(srv.hits(), 3);
 
-                const capturedHeaders = srv.headers();
-                assert.equal(capturedHeaders.length, 3);
+                const reqHeaders = srv.headers();
+                const reqBodies = srv.bodies();
+                const ids = reqHeaders.map((h) => h["x-webhook-id"]);
+                assert.deepEqual(ids, [EVENT.id, EVENT.id, EVENT.id]);
 
-                // Verify each attempt has a signature header and all signatures verify.
-                const body = JSON.stringify(EVENT);
-                for (const h of capturedHeaders) {
-                    const sig = h["x-webhook-signature"] as string;
-                    assert.ok(sig, "signature header present on each attempt");
-                    const vr = verifySignature({ secret, body, header: sig, toleranceSeconds: 300 });
-                    assert.equal(vr.valid, true, "signature verifies with per-attempt timestamp");
-                }
-                // X-Webhook-Id must be stable across retries for deduplication.
-                const ids = capturedHeaders.map((h) => h["x-webhook-id"] as string);
-                assert.equal(ids.length, 3);
-                assert.equal(ids[0], ids[1]);
-                assert.equal(ids[1], ids[2]);
+                const sigHeaders = reqHeaders.map((h, idx) => {
+                    const sigHeader = h["x-webhook-signature"];
+                    if (typeof sigHeader !== "string") {
+                        assert.fail("expected string X-Webhook-Signature header");
+                    }
+                    const match = /^t=(\d+),v1=[0-9a-f]{64}$/.exec(sigHeader);
+                    assert.ok(match, `invalid signature header: ${sigHeader}`);
+                    const expectedTs = baseSec + idx * 200;
+                    assert.equal(Number(match[1]), expectedTs);
+                    assert.deepEqual(
+                        verifySignature({
+                            secret,
+                            body: reqBodies[idx],
+                            header: sigHeader,
+                            now: expectedTs,
+                        }),
+                        { valid: true },
+                    );
+                    return sigHeader;
+                });
+
+                assert.notEqual(sigHeaders[0], sigHeaders[1]);
+                assert.notEqual(sigHeaders[1], sigHeaders[2]);
             } finally {
+                Date.now = realDateNow;
                 await srv.close();
             }
         });

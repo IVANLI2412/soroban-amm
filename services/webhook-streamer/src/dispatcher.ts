@@ -346,11 +346,6 @@ export class WebhookDispatcher {
     let delayMs = 0;
 
     for (let attempt = 0; ; attempt++) {
-      // Build per-attempt headers: base + fresh signature if secret is configured.
-      const headers: Record<string, string> = { ...baseHeaders };
-      if (sub.secret) {
-        headers[SIGNATURE_HEADER] = signPayload(sub.secret, body);
-      }
       if (delayMs > 0) {
         await this.sleep(delayMs);
       }
@@ -360,6 +355,19 @@ export class WebhookDispatcher {
 
       const attemptedAt = Date.now();
       this.counters.attempted += 1;
+
+      // Re-sign each attempt with its own timestamp (matching README.md) while
+      // keeping X-Webhook-Id constant so receivers can deduplicate retries.
+      const headers: Record<string, string> = sub.secret
+        ? {
+            ...baseHeaders,
+            [SIGNATURE_HEADER]: signPayload(
+              sub.secret,
+              body,
+              Math.floor(attemptedAt / 1000),
+            ),
+          }
+        : baseHeaders;
 
       const outcome = await this._attempt(
         sub,
